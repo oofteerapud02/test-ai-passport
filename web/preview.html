@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VRMA Preview</title>
+<style>
+  :root{color-scheme:dark}
+  html,body{margin:0;height:100%;background:#11131a;color:#e8eaf0;
+            font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+  #ui{position:fixed;top:14px;left:14px;z-index:10;background:#1b1e26cc;backdrop-filter:blur(8px);
+      border:1px solid #2f3546;border-radius:12px;padding:14px 16px;font-size:13px;max-width:290px}
+  #ui h2{margin:0 0 10px;font-size:15px}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:9px}
+  .row span{color:#9aa3b8;width:52px;flex:none}
+  input[type=file]{font-size:12px;width:100%}
+  button{background:#4f6df5;border:0;color:#fff;border-radius:7px;padding:6px 13px;
+         font-size:13px;cursor:pointer}
+  button:disabled{opacity:.4;cursor:default}
+  #msg{color:#9aa3b8;font-size:12px;white-space:pre-line;margin-top:6px}
+  #msg.err{color:#ff8b8b} #msg.ok{color:#7ee0a8}
+  a{color:#7f9bff}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.178.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.178.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://unpkg.com/@pixiv/three-vrm@3.4.2/lib/three-vrm.module.js",
+    "@pixiv/three-vrm-animation": "https://unpkg.com/@pixiv/three-vrm-animation@3.4.2/lib/three-vrm-animation.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="ui">
+  <h2>พรีวิว VRMA</h2>
+  <div class="row"><span>VRM</span><input id="vrmFile" type="file" accept=".vrm"></div>
+  <div class="row"><span>VRMA</span><input id="vrmaFile" type="file" accept=".vrma,.glb"></div>
+  <div class="row">
+    <button id="play" disabled>เล่น / หยุด</button>
+    <button id="reset" disabled>รีเซ็ต</button>
+  </div>
+  <div id="msg">เลือกไฟล์ .vrm ก่อน แล้วค่อยใส่ .vrma</div>
+  <div style="margin-top:8px"><a href="/web/index.html">← กลับหน้าแปลงไฟล์</a></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
+
+const $ = (id) => document.getElementById(id);
+const msg = (t, k) => { const e = $('msg'); e.textContent = t; e.className = k || ''; };
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x11131a);
+scene.add(new THREE.GridHelper(10, 20, 0x3a4054, 0x252936));
+scene.add(new THREE.AmbientLight(0xffffff, 1.6));
+const dir = new THREE.DirectionalLight(0xffffff, 1.8);
+dir.position.set(1, 2, 1.5);
+scene.add(dir);
+
+const camera = new THREE.PerspectiveCamera(32, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 1.25, 3.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.0, 0);
+controls.enableDamping = true;
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- loader ----------
+const loader = new GLTFLoader();
+loader.register(p => new VRMLoaderPlugin(p));
+loader.register(p => new VRMAnimationLoaderPlugin(p));
+
+let currentVrm = null, mixer = null, action = null;
+
+// ทำงานได้ทั้ง three-vrm v2 และ v3 — ไม่พังถ้าฟังก์ชันไม่มี
+function optimize(vrm, gltf) {
+  const u = VRMUtils;
+  try { u.removeUnnecessaryVertices?.(gltf.scene); } catch (_) {}
+  try {
+    if (typeof u.combineSkeletons === 'function') u.combineSkeletons(gltf.scene);
+    else if (typeof u.removeUnnecessaryJoints === 'function') u.removeUnnecessaryJoints(gltf.scene);
+  } catch (_) {}
+  try { u.combineMorphs?.(vrm); } catch (_) {}
+  vrm.scene.traverse(o => { o.frustumCulled = false; });
+}
+
+async function loadVRM(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    msg('กำลังโหลดโมเดล...');
+    const gltf = await loader.loadAsync(url);
+    const vrm = gltf.userData.vrm;
+    if (!vrm) throw new Error('ไฟล์นี้ไม่ใช่ VRM ที่ถูกต้อง');
+
+    if (currentVrm) { scene.remove(currentVrm.scene); VRMUtils.deepDispose?.(currentVrm.scene); }
+    optimize(vrm, gltf);
+    scene.add(vrm.scene);
+    currentVrm = vrm;
+    mixer = new THREE.AnimationMixer(vrm.scene);
+    action = null;
+    $('play').disabled = $('reset').disabled = true;
+    msg('โหลดโมเดลสำเร็จ ✓ ตอนนี้เลือกไฟล์ .vrma ได้เลย', 'ok');
+  } catch (e) {
+    msg('โหลดโมเดลไม่สำเร็จ: ' + e.message, 'err');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function loadVRMA(file) {
+  if (!currentVrm) return msg('กรุณาโหลดไฟล์ .vrm ก่อนครับ', 'err');
+  const url = URL.createObjectURL(file);
+  try {
+    msg('กำลังโหลดแอนิเมชัน...');
+    const gltf = await loader.loadAsync(url);
+    const anim = gltf.userData.vrmAnimations?.[0];
+    if (!anim) throw new Error('ไม่พบข้อมูล VRMC_vrm_animation ในไฟล์นี้');
+
+    const clip = createVRMAnimationClip(anim, currentVrm);
+    mixer.stopAllAction();
+    action = mixer.clipAction(clip);
+    action.play();
+    $('play').disabled = $('reset').disabled = false;
+    msg(`เล่นอยู่ ✓ ความยาว ${clip.duration.toFixed(2)} วิ · ${clip.tracks.length} tracks`, 'ok');
+  } catch (e) {
+    msg('โหลดแอนิเมชันไม่สำเร็จ: ' + e.message, 'err');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+$('vrmFile').onchange  = e => e.target.files[0] && loadVRM(e.target.files[0]);
+$('vrmaFile').onchange = e => e.target.files[0] && loadVRMA(e.target.files[0]);
+$('play').onclick  = () => { if (action) action.paused = !action.paused; };
+$('reset').onclick = () => { if (action) { action.reset().play(); action.paused = false; } };
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  mixer?.update(dt);
+  currentVrm?.update(dt);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

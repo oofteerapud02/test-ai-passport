@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NPZ / BVH → VRMA</title>
+<style>
+  :root{color-scheme:dark}
+  body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#15171d;color:#e8eaf0;
+       max-width:720px;margin:0 auto;padding:48px 20px}
+  h1{font-size:22px;margin:0 0 6px}
+  p.sub{color:#8b93a7;margin:0 0 28px;font-size:14px}
+  #drop{border:2px dashed #4a5169;border-radius:14px;padding:52px 20px;text-align:center;
+        cursor:pointer;transition:.15s;background:#1b1e26}
+  #drop.on{background:#232842;border-color:#6d84ff}
+  #drop.busy{opacity:.5;pointer-events:none}
+  .opts{display:flex;gap:16px;flex-wrap:wrap;margin:22px 0;font-size:14px;align-items:center}
+  label{display:flex;gap:6px;align-items:center;color:#c3c9d8}
+  select,input[type=number]{background:#252936;border:1px solid #3a4054;color:#e8eaf0;
+        border-radius:6px;padding:5px 8px;width:78px}
+  a.btn{display:inline-block;background:#4f6df5;color:#fff;text-decoration:none;
+        padding:9px 16px;border-radius:8px;font-size:14px}
+  #log{margin-top:18px;font-size:14px;color:#9aa3b8;min-height:24px;white-space:pre-line}
+  #log.err{color:#ff8b8b}
+  #log.ok{color:#7ee0a8}
+  code{background:#252936;padding:2px 6px;border-radius:4px;font-size:13px}
+</style>
+</head>
+<body>
+  <h1>แปลง .npz / .bvh → .vrma</h1>
+  <p class="sub">ผลลัพธ์ 180 เฟรม · retarget กระดูกอัตโนมัติ · ใช้กับ three-vrm ได้ทันที</p>
+
+  <div id="drop">ลากไฟล์มาวาง หรือคลิกเพื่อเลือก<br>
+    <small style="color:#767e94">เลือกได้หลายไฟล์ → ดาวน์โหลดเป็น .zip</small>
+  </div>
+
+  <div class="opts">
+    <label>Up axis
+      <select id="up"><option value="">auto</option><option>y</option><option>z</option></select>
+    </label>
+    <label>Yaw <input id="yaw" type="number" value="0" step="90"></label>
+    <label>FPS <input id="fps" type="number" value="30" min="1"></label>
+    <label>Frames <input id="frames" type="number" value="180" min="1"></label>
+    <label>Mode
+      <select id="mode"><option value="resample">resample</option><option value="clip">clip</option></select>
+    </label>
+    <label><input id="face" type="checkbox"> jaw/eyes (SMPL-X)</label>
+  </div>
+
+  <p><a class="btn" href="/web/preview.html">→ เปิดหน้าพรีวิว 3D</a></p>
+  <div id="log">พร้อมทำงาน</div>
+  <p style="color:#767e94;font-size:13px;margin-top:26px">
+    เรียกจากโปรเจกต์อื่น: <code>POST /api/convert</code> (field ชื่อ <code>file</code>) ·
+    หลายไฟล์: <code>POST /api/convert-batch</code> (field <code>files</code>)
+  </p>
+
+  <input id="picker" type="file" accept=".npz,.bvh" multiple hidden>
+
+<script>
+// ใช้ $() เสมอ — ห้ามอ้าง id ตรง ๆ เพราะชื่ออย่าง frames/name/status ชนกับ window
+const $ = (id) => document.getElementById(id);
+const drop = $('drop'), picker = $('picker');
+
+function log(text, kind) {
+  const el = $('log');
+  el.textContent = text;
+  el.className = kind || '';
+}
+
+drop.onclick = () => picker.click();
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('on'); };
+drop.ondragleave = () => drop.classList.remove('on');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('on'); run(e.dataTransfer.files); };
+picker.onchange = () => run(picker.files);
+
+function num(id, fallback) {
+  const v = parseFloat($(id).value);
+  return Number.isFinite(v) && v > 0 ? String(v) : fallback;
+}
+
+function opts(fd) {
+  fd.append('up',     $('up').value || '');
+  fd.append('yaw',    Number.isFinite(parseFloat($('yaw').value)) ? $('yaw').value : '0');
+  fd.append('fps',    num('fps', '30'));
+  fd.append('frames', num('frames', '180'));
+  fd.append('mode',   $('mode').value || 'resample');
+  fd.append('face',   $('face').checked ? 'true' : 'false');
+  return fd;
+}
+
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+async function readError(res) {
+  const raw = await res.text();
+  try {
+    const j = JSON.parse(raw);
+    if (!j.detail) return raw;
+    return Array.isArray(j.detail)
+      ? j.detail.map(d => `${(d.loc || []).slice(-1)[0]}: ${d.msg}`).join('\n')
+      : j.detail;
+  } catch (_) {
+    return raw || `HTTP ${res.status}`;
+  }
+}
+
+async function run(fileList) {
+  if (!fileList || !fileList.length) return;
+  const list = [...fileList];
+  drop.classList.add('busy');
+  log(`กำลังแปลง ${list.length} ไฟล์...`);
+
+  try {
+    if (list.length === 1) {
+      const fd = opts(new FormData());
+      fd.append('file', list[0]);
+      const res = await fetch('/api/convert', { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await readError(res));
+      download(await res.blob(), list[0].name.replace(/\.[^.]+$/, '.vrma'));
+      log('เสร็จแล้ว ✓ ดาวน์โหลดอัตโนมัติ', 'ok');
+    } else {
+      const fd = opts(new FormData());
+      list.forEach(f => fd.append('files', f));
+      const res = await fetch('/api/convert-batch', { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await readError(res));
+      download(await res.blob(), 'vrma_batch.zip');
+      log(`เสร็จแล้ว ✓ ${list.length} ไฟล์ (ถ้ามีที่พลาด ดูใน _errors.txt)`, 'ok');
+    }
+  } catch (e) {
+    log('ผิดพลาด: ' + e.message, 'err');
+  } finally {
+    drop.classList.remove('busy');
+    picker.value = '';
+  }
+}
+</script>
+</body>
+</html>
